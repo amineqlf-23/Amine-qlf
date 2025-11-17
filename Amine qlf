@@ -1,0 +1,273 @@
+# main.py
+# تطبيق Kivy لإشارات الفوركس/المعادن/العملات الرقمية مع مؤشرات فنية وإشعارات
+# متطلبات: python3,kivy,yfinance,pandas,numpy,requests,nltk,plyer
+
+import threading, time
+from datetime import datetime
+import yfinance as yf
+import pandas as pd, numpy as np
+import requests, nltk
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+
+from kivy.app import App
+from kivy.clock import mainthread
+from kivy.lang import Builder
+from kivy.properties import StringProperty, ListProperty, BooleanProperty
+from kivy.uix.boxlayout import BoxLayout
+
+try:
+    from plyer import notification
+except:
+    notification = None
+
+nltk.download("vader_lexicon", quiet=True)
+SIA = SentimentIntensityAnalyzer()
+
+CONFIG = {
+    "ASSETS": [
+        {"symbol": "EURUSD=X", "name": "EUR/USD"},
+        {"symbol": "GBPUSD=X", "name": "GBP/USD"},
+        {"symbol": "USDJPY=X", "name": "USD/JPY"},
+        {"symbol": "XAUUSD=X", "name": "GOLD XAU/USD"},
+        {"symbol": "XAGUSD=X", "name": "SILVER XAG/USD"},
+        {"symbol": "BTC-USD", "name": "BTC/USD"},
+        {"symbol": "ETH-USD", "name": "ETH/USD"},
+    ],
+    "INTERVAL_MINUTES": 5,
+    "FETCH_PERIOD": "2d",
+    "NEWSAPI_KEY": "",
+    "TWITTER_BEARER": "",
+    "TELEGRAM_TOKEN": "",
+    "TELEGRAM_CHAT_ID": "",
+    "SENTIMENT_ENABLED": True,
+    "NOTIFY_ON_STRONG": True,
+}
+
+# ---------- المؤشرات الفنية ----------
+def ema(series, span): return series.ewm(span=span, adjust=False).mean()
+def rsi(series, period=14):
+    delta=series.diff(); up=delta.clip(lower=0); down=-delta.clip(upper=0)
+    ma_up=up.ewm(com=period-1, adjust=False).mean()
+    ma_down=down.ewm(com=period-1, adjust=False).mean()
+    rs=ma_up/ma_down
+    return 100-(100/(1+rs))
+def macd(series, fast=12, slow=26, signal=9):
+    efast=ema(series, fast); eslow=ema(series, slow)
+    macd_line=efast-eslow
+    sig=macd_line.ewm(span=signal, adjust=False).mean()
+    hist=macd_line-sig
+    return macd_line,sig,hist
+def atr(high, low, close, period=14):
+    tr1=high-low; tr2=(high-close.shift()).abs(); tr3=(low-close.shift()).abs()
+    tr=pd.concat([tr1,tr2,tr3],axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+# ---------- البيانات ----------
+def fetch_price_history(symbol, period=CONFIG["FETCH_PERIOD"], interval=f"{CONFIG['INTERVAL_MINUTES']}m"):
+    try:
+        df=yf.download(symbol, period=period, interval=interval, progress=False)
+        if df.empty: return None
+        return df.dropna()
+    except: return None
+
+# ---------- التحليل المعنوي ----------
+def fetch_news_headlines(query,page_size=5):
+    key=CONFIG.get("NEWSAPI_KEY") or ""
+    if not key: return []
+    url="https://newsapi.org/v2/everything"
+    params={"q":query,"language":"en","sortBy":"publishedAt","pageSize":page_size,"apiKey":key}
+    try: r=requests.get(url,params=params,timeout=8); j=r.json(); return [a.get("title","")+"."+ (a.get("description") or "") for a in j.get("articles",[])] if j.get("status")=="ok" else []
+    except: return []
+
+def fetch_tweets_text(query,max_results=10):
+    token=CONFIG.get("TWITTER_BEARER") or ""
+    if not token: return []
+    try:
+        url=f"https://api.twitter.com/2/tweets/search/recent?query={requests.utils.quote(query+' -is:retweet lang:en')}&max_results={max_results}"
+        headers={"Authorization":f"Bearer {token}"}
+        r=requests.get(url,headers=headers,timeout=8); j=r.json()
+        return [t.get("text","") for t in j.get("data",[])] if "data" in j else []
+    except: return []
+
+def analyze_sentiment_texts(texts):
+    if not texts: return {"compound":0.0,"label":"محايد"}
+    scores=[SIA.polarity_scores(t) for t in texts[:12]]
+    comp=float(np.mean([s["compound"] for s in scores]))
+    label="محايد"
+    if comp>0.05: label="إيجابي"
+    elif comp<-0.05: label="سلبي"
+    return {"compound":comp,"label":label}
+
+# ---------- توليد الإشارة ----------
+RSI_OVERSOLD=30; RSI_OVERBOUGHT=70
+def generate_signal(last_price, indicators, sentiment):
+    score=0.0; reasons=[]
+    rsi_v=indicators.get("rsi"); macd_hist=indicators.get("macd_hist"); ema12=indicators.get("ema12"); ema26=indicators.get("ema26"); senti_c=sentiment.get("compound",0.0)
+    if macd_hist is not None: score+=0.2 if macd_hist>0 else -0.2; reasons.append("MACD إيجابي" if macd_hist>0 else "MACD سلبي")
+    if ema12 and ema26: score+=0.2 if ema12>ema26 else -0.2; reasons.append("EMA12 فوق EMA26" if ema12>ema26 else "EMA12 تحت EMA26")
+    if rsi_v is not None:
+        if rsi_v<RSI_OVERSOLD: score+=0.3; reasons.append(f"RSI {rsi_v:.1f} تشبع شراء")
+        elif rsi_v>RSI_OVERBOUGHT: score-=0.3; reasons.append(f"RSI {rsi_v:.1f} تشبع بيع")
+        else: reasons.append(f"RSI {rsi_v:.1f}")
+    if senti_c>0.05: score+=0.2; reasons.append(f"معنويات إيجابية {senti_c:.2f}")
+    elif senti_c<-0.05: score-=0.2; reasons.append(f"معنويات سلبية {senti_c:.2f}")
+    else: reasons.append(f"معنويات محايدة {senti_c:.2f}")
+    if score>=0.25: return "Buy",score,reasons
+    elif score<=-0.25: return "Sell",score,reasons
+    else: return "Wait",score,reasons
+
+def calc_sl_tp(side,price,atr_val=None):
+    if atr_val and not pd.isna(atr_val) and atr_val>0: sl_dist=atr_val*1.5
+    else: sl_dist=price*0.005
+    if side=="Buy": sl=price-sl_dist; tp=price+sl_dist*2
+    elif side=="Sell": sl=price+sl_dist; tp=price-sl_dist*2
+    else: sl=None; tp=None
+    return sl,tp
+
+# ---------- واجهة Kivy ----------
+KV='''
+<AssetRow@BoxLayout>:
+    orientation: "vertical"
+    size_hint_y: None
+    height: dp(110)
+    padding: dp(8)
+    canvas.before:
+        Color: rgba: .12,.12,.12,1
+        RoundedRectangle: pos: self.pos; size: self.size; radius: [8,]
+    Label: id: title; text: root.title; size_hint_y: None; height: dp(24); bold: True
+    Label: id: signal; text: root.signal_text; size_hint_y: None; height: dp(28)
+    Label: id: details; text: root.details; text_size: self.width,None; size_hint_y: None; height: dp(48)
+
+BoxLayout:
+    orientation: "vertical"; padding: dp(8); spacing: dp(8)
+    BoxLayout: size_hint_y: None; height: dp(48); spacing: dp(8)
+        Button: text: "تحديث الآن"; on_press: app.manual_refresh()
+        Button: text: "خيارات"; on_press: app.open_settings()
+        Label: text: app.status_text
+    ScrollView: do_scroll_x: False
+        GridLayout: id: grid; cols:1; size_hint_y: None; height: self.minimum_height; row_default_height: dp(110); row_force_default: True
+'''
+
+class AssetRow(BoxLayout):
+    title=StringProperty(""); signal_text=StringProperty(""); details=StringProperty("")
+
+class MainApp(App):
+    assets=ListProperty([]); status_text=StringProperty("جاهز"); stop_flag=BooleanProperty(False)
+    def build(self):
+        self.root=Builder.load_string(KV)
+        self.assets=CONFIG["ASSETS"]
+        for a in self.assets:
+            row=AssetRow(); row.title=a["name"]; row.signal_text="جارِ التحميل..."; row.details=""
+            self.root.ids.grid.add_widget(row)
+            a["row"]=row
+        threading.Thread(target=self.background_loop,daemon=True).start()
+        return self.root
+
+    @mainthread
+    def update_row(self, idx, signal_text, details):
+        try: a=self.assets[idx]; row=a.get("row"); row.signal_text=signal_text; row.details=details
+        except: pass
+
+    def manual_refresh(self): threading.Thread(target=self.fetch_all_once,daemon=True).start()
+    def open_settings(self): self.status_text="الإعدادات غير متاحة حالياً."
+    def background_loop(self):
+        while True and not self.stop_flag:
+            self.status_text="تحديث: "+datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+            self.fetch_all_once()
+            time.sleep(CONFIG["INTERVAL_MINUTES"]*60)
+    def fetch_all_once(self):
+        for idx,a in enumerate(self.assets):
+            try:
+                sym=a["symbol"]; df=fetch_price_history(sym)
+                if df is None or df.empty: self.update_row(idx,"بدون بيانات","تعذر جلب بيانات."); continue
+                close=df["Close"]; high=df["High"]; low=df["Low"]; last_price=float(close.iloc[-1])
+                indicators={"ema12":float(ema(close,12).iloc[-1]),"ema26":float(ema(close,26).iloc[-1]),"rsi":float(rsi(close).iloc[-1])}
+                _,_,macd_hist=macd(close); indicators["macd_hist"]=float(macd_hist.iloc[-1])
+                indicators["atr"]=float(atr(high,low,close).iloc[-1])
+                sent={"compound":0.0,"label":"محايد"}
+                if CONFIG["SENTIMENT_ENABLED"]:
+                    texts=fetch_news_headlines(a["name"],4)+fetch_tweets_text(a["name"],6)
+                    sent=analyze_sentiment_texts(texts)
+                signal,conf,reasons=generate_signal(last_price,indicators,sent)
+                sl,tp=calc_sl_tp(signal,last_price,indicators.get("atr"))
+                details=f"Indicators: EMA12={indicators['ema12']:.5f} EMA26={indicators['ema26']:.5f} RSI={indicators['rsi']:.1f} MACD_hist={indicators['macd_hist']:.6f}\\nSentiment: {sent['label']} ({sent['compound']:.3f})\\nSL: {sl:.5f if sl else 'N/A'} TP: {tp:.5f if tp else 'N/A'}"
+                self.update_row(idx,f"{signal} (conf {conf:.2f})",details)
+                if CONFIG["NOTIFY_ON_STRONG"] and abs(conf)>=0.6 and signal in ("Buy","Sell"):
+                    title=f"{a['name']} -> {signal}"; body=f"{signal} conf {conf:.2f} | {sent['label']} {sent['compound']:.3f}"; self.send_notification(title,body)
+                    if CONFIG.get("TELEGRAM_TOKEN") and CONFIG.get("TELEGRAM_CHAT_ID"): self.send_telegram_message(f"{a['name']} — {signal} (conf {conf:.2f})\\n{details}")
+            except Exception as e: self.update_row(idx,"خطأ",str(e))
+
+    def send_notification(self,title,message):
+        try: notification.notify(title=title,message=message,timeout=6) if notification else None
+        except: pass
+    def send_telegram_message(self,text):
+        try:
+            token=CONFIG.get("TELEGRAM_TOKEN"); chat=CONFIG.get("TELEGRAM_CHAT_ID")
+            if not token or not chat: return
+            url=f"https://api.telegram.org/bot{token}/sendMessage"; requests.post(url,data={"chat_id":chat,"text":text},timeout=6)
+        except: pass
+    def on_stop(self): self.stop_flag=True
+if __name__=="__main__": MainApp().run()
+[app]
+title = FXSignalsSimple
+package.name = fxsignalssimple
+package.domain = org.example
+source.dir = .
+source.include_exts = py,png,jpg,kv,txt
+version = 0.1
+orientation = portrait
+fullscreen = 0
+requirements = python3,kivy,yfinance,pandas,numpy,requests,nltk,plyer
+android.permissions = INTERNET,WAKE_LOCK,ACCESS_NETWORK_STATE,FOREGROUND_SERVICE
+
+[buildozer]
+log_level = 2
+warn_on_root = 1
+name: Build APK
+on:
+  push: { branches: [ main ] }
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env: { ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: distribution: 'temurin'
+        java-version: '11'
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip python3-setuptools git zip unzip openjdk-11-jdk zlib1g-dev libncurses5 libstdc++6 libffi-dev
+          pip3 install --upgrade pip
+          pip3 install buildozer==1.4.2 cython==0.29.34
+      - uses: r0adkll/setup-android@v2
+        with:
+          api-levels: 33
+          target: android-33
+          ndk: 25.2.9519653
+          components: "build-tools;33.0.2,platforms;android-33,platform-tools"
+      - run: buildozer -v android debug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fxsignals-apk
+          path: bin/*.apk
+# FXSignalsSimple - تعليمات APK
+
+## الملفات
+- main.py
+- buildozer.spec
+- .github/workflows/build-apk.yml
+
+## خطوات البناء
+1. ارفع كل الملفات لمستودع GitHub جديد (branch main).
+2. افتح تبويب Actions → Run workflow (Build APK).
+3. بعد الانتهاء، اذهب إلى Artifacts → fxsignals-apk → حمل APK.
+
+## إعداد المفاتيح (اختياري)
+- NewsAPI/Twitter: ضع المفاتيح داخل main.py
+- Telegram: TOKEN + CHAT_ID داخل CONFIG
+
+## تشغيل التطبيق
+- اضغط "تحديث الآن" أو انتظر التحديث التلقائي كل 5 دقائق.
+- الإشعارات ستظهر عند وجود إشارة قوية.
